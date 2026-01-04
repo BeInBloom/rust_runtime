@@ -2,22 +2,29 @@ use std::{
     collections::BTreeMap,
     mem,
     pin::Pin,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, OnceLock},
     task::{Context, Poll, Waker},
-    thread::{self, spawn},
+    thread,
     time::{Duration, Instant},
 };
 
-#[derive(Default)]
+use parking_lot::{Condvar, Mutex, MutexGuard};
+
+const REACTOR_THREAD_NAME: &str = "timer-reactor";
+
 struct TimerRegistry {
     timers: BTreeMap<Instant, Vec<Waker>>,
 }
 
-impl TimerRegistry {
-    fn new() -> Self {
-        Self::default()
+impl Default for TimerRegistry {
+    fn default() -> Self {
+        Self {
+            timers: BTreeMap::new(),
+        }
     }
+}
 
+impl TimerRegistry {
     fn register(&mut self, deadline: Instant, waker: Waker) {
         self.timers.entry(deadline).or_default().push(waker);
     }
@@ -28,8 +35,8 @@ impl TimerRegistry {
 
     fn pop_ready_wakers(&mut self, now: Instant) -> Vec<Waker> {
         let pending = self.timers.split_off(&(now + Duration::from_nanos(1)));
-        let ready_timers = mem::replace(&mut self.timers, pending);
-        ready_timers.into_values().flatten().collect()
+        let ready = mem::replace(&mut self.timers, pending);
+        ready.into_values().flatten().collect()
     }
 }
 
@@ -41,25 +48,27 @@ pub struct Reactor {
 impl Reactor {
     fn new() -> Arc<Self> {
         Arc::new(Reactor {
-            registry: Mutex::new(TimerRegistry::new()),
+            registry: Mutex::new(TimerRegistry::default()),
             condvar: Condvar::new(),
         })
     }
 
     fn run(self: Arc<Self>) {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = self.registry.lock();
 
         loop {
             let now = Instant::now();
 
-            if let Some(deadline) = registry.next_deadline() {
-                if now >= deadline {
+            match registry.next_deadline() {
+                Some(deadline) if now >= deadline => {
                     registry = self.process_ready_timers(registry, now);
-                } else {
-                    registry = self.park_thread_until(registry, deadline);
                 }
-            } else {
-                registry = self.park_thread_indefinitely(registry);
+                Some(deadline) => {
+                    registry = self.park_until(registry, deadline);
+                }
+                None => {
+                    registry = self.park_indefinitely(registry);
+                }
             }
         }
     }
@@ -70,84 +79,90 @@ impl Reactor {
         now: Instant,
     ) -> MutexGuard<'_, TimerRegistry> {
         let wakers = registry.pop_ready_wakers(now);
-
         drop(registry);
 
         for waker in wakers {
             waker.wake();
         }
 
-        self.registry.lock().unwrap()
+        self.registry.lock()
     }
 
-    #[inline]
-    fn park_thread_until<'a>(
+    fn park_until<'a>(
         &self,
-        registry: MutexGuard<'a, TimerRegistry>,
+        mut registry: MutexGuard<'a, TimerRegistry>,
         deadline: Instant,
     ) -> MutexGuard<'a, TimerRegistry> {
         let now = Instant::now();
 
         if deadline > now {
-            let duration = deadline - now;
-            self.condvar.wait_timeout(registry, duration).unwrap().0
-        } else {
-            registry
+            self.condvar.wait_for(&mut registry, deadline - now);
         }
+
+        registry
     }
 
-    #[inline]
-    fn park_thread_indefinitely<'a>(
+    fn park_indefinitely<'a>(
         &self,
-        registry: MutexGuard<'a, TimerRegistry>,
+        mut registry: MutexGuard<'a, TimerRegistry>,
     ) -> MutexGuard<'a, TimerRegistry> {
-        self.condvar.wait(registry).unwrap()
+        self.condvar.wait(&mut registry);
+        registry
     }
 
-    #[inline]
-    fn registry(&self, deadline: Instant, waker: Waker) {
-        let mut registry = self.registry.lock().unwrap();
+    fn register_timer(&self, deadline: Instant, waker: Waker) {
+        let mut registry = self.registry.lock();
         registry.register(deadline, waker);
         self.condvar.notify_one();
     }
 }
 
-static REACTOR: OnceLock<Arc<Reactor>> = OnceLock::new();
+static GLOBAL_REACTOR: OnceLock<Arc<Reactor>> = OnceLock::new();
 
 fn get_reactor() -> &'static Arc<Reactor> {
-    REACTOR.get_or_init(|| {
-        let reactor = Reactor::new();
-        let reactor_clone = reactor.clone();
+    GLOBAL_REACTOR.get_or_init(initialize_reactor)
+}
 
-        thread::Builder::new()
-            .name("timer-reactor".to_string())
-            .spawn(move || reactor_clone.run())
-            .expect("cant run reactor of thread");
+fn initialize_reactor() -> Arc<Reactor> {
+    let reactor = Reactor::new();
+    spawn_reactor_thread(reactor.clone());
+    reactor
+}
 
-        reactor
-    })
+fn spawn_reactor_thread(reactor: Arc<Reactor>) {
+    thread::Builder::new()
+        .name(REACTOR_THREAD_NAME.to_string())
+        .spawn(move || reactor.run())
+        .expect("failed to spawn reactor thread");
 }
 
 pub struct SleepFuture {
     deadline: Instant,
-    registered: bool,
+    is_registered: bool,
+}
+
+impl SleepFuture {
+    fn is_ready(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    fn ensure_registered(&mut self, cx: &mut Context<'_>) {
+        if !self.is_registered {
+            get_reactor().register_timer(self.deadline, cx.waker().clone());
+            self.is_registered = true;
+        }
+    }
 }
 
 impl Future for SleepFuture {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let now = Instant::now();
-
-        if now > self.deadline {
+        if self.is_ready() {
             return Poll::Ready(());
         }
 
-        if !self.registered {
-            get_reactor().registry(self.deadline, cx.waker().clone());
-            self.registered = true;
-        }
-
+        self.ensure_registered(cx);
         Poll::Pending
     }
 }
@@ -155,6 +170,6 @@ impl Future for SleepFuture {
 pub fn sleep(duration: Duration) -> SleepFuture {
     SleepFuture {
         deadline: Instant::now() + duration,
-        registered: false,
+        is_registered: false,
     }
 }
