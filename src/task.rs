@@ -1,8 +1,9 @@
 use crossbeam::channel::Sender;
 use futures::task::ArcWake;
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -13,10 +14,6 @@ pub struct Task {
 
 impl ArcWake for Task {
     fn wake_by_ref(arc_self: &Arc<Self>) {
-        let cloned = arc_self.clone();
-        arc_self
-            .task_sender
-            .send(cloned)
-            .expect("Очередь задач закрыта");
+        let _ = arc_self.task_sender.send(arc_self.clone());
     }
 }
