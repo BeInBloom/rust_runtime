@@ -1,44 +1,13 @@
-use std::{
-    collections::BTreeMap,
-    mem,
-    pin::Pin,
-    sync::{Arc, OnceLock},
-    task::{Context, Poll, Waker},
-    thread,
-    time::{Duration, Instant},
-};
+use std::sync::{Arc, OnceLock};
+use std::task::Waker;
+use std::thread;
+use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
+use super::registry::TimerRegistry;
+
 const REACTOR_THREAD_NAME: &str = "timer-reactor";
-
-struct TimerRegistry {
-    timers: BTreeMap<Instant, Vec<Waker>>,
-}
-
-impl Default for TimerRegistry {
-    fn default() -> Self {
-        Self {
-            timers: BTreeMap::new(),
-        }
-    }
-}
-
-impl TimerRegistry {
-    fn register(&mut self, deadline: Instant, waker: Waker) {
-        self.timers.entry(deadline).or_default().push(waker);
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        self.timers.keys().next().copied()
-    }
-
-    fn pop_ready_wakers(&mut self, now: Instant) -> Vec<Waker> {
-        let pending = self.timers.split_off(&(now + Duration::from_nanos(1)));
-        let ready = mem::replace(&mut self.timers, pending);
-        ready.into_values().flatten().collect()
-    }
-}
 
 pub struct Reactor {
     registry: Mutex<TimerRegistry>,
@@ -110,7 +79,7 @@ impl Reactor {
         registry
     }
 
-    fn register_timer(&self, deadline: Instant, waker: Waker) {
+    pub fn register_timer(&self, deadline: Instant, waker: Waker) {
         let mut registry = self.registry.lock();
         registry.register(deadline, waker);
         self.condvar.notify_one();
@@ -119,7 +88,7 @@ impl Reactor {
 
 static GLOBAL_REACTOR: OnceLock<Arc<Reactor>> = OnceLock::new();
 
-fn get_reactor() -> &'static Arc<Reactor> {
+pub(super) fn get_reactor() -> &'static Arc<Reactor> {
     GLOBAL_REACTOR.get_or_init(initialize_reactor)
 }
 
@@ -134,42 +103,4 @@ fn spawn_reactor_thread(reactor: Arc<Reactor>) {
         .name(REACTOR_THREAD_NAME.to_string())
         .spawn(move || reactor.run())
         .expect("failed to spawn reactor thread");
-}
-
-pub struct SleepFuture {
-    deadline: Instant,
-    is_registered: bool,
-}
-
-impl SleepFuture {
-    fn is_ready(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
-    fn ensure_registered(&mut self, cx: &mut Context<'_>) {
-        if !self.is_registered {
-            get_reactor().register_timer(self.deadline, cx.waker().clone());
-            self.is_registered = true;
-        }
-    }
-}
-
-impl Future for SleepFuture {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.is_ready() {
-            return Poll::Ready(());
-        }
-
-        self.ensure_registered(cx);
-        Poll::Pending
-    }
-}
-
-pub fn sleep(duration: Duration) -> SleepFuture {
-    SleepFuture {
-        deadline: Instant::now() + duration,
-        is_registered: false,
-    }
 }

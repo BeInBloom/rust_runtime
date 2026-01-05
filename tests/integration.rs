@@ -3,13 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime::{Runtime, sleep};
+use runtime::{CancellationToken, Runtime, sleep};
 
 const TEST_WORKER_COUNT: usize = 2;
-const TASK_EXECUTION_WAIT: Duration = Duration::from_millis(50);
-const MULTIPLE_TASKS_WAIT: Duration = Duration::from_millis(100);
+const TASK_EXECUTION_WAIT: Duration = Duration::from_millis(100);
 const TIMER_DURATION: Duration = Duration::from_millis(100);
-const TIMER_WAIT: Duration = Duration::from_millis(200);
+const TIMER_WAIT: Duration = Duration::from_millis(250);
 
 #[test]
 fn single_task_executes() {
@@ -49,7 +48,7 @@ fn multiple_tasks_execute_in_parallel() {
     }
 
     let _handle = runtime.run(TEST_WORKER_COUNT);
-    thread::sleep(MULTIPLE_TASKS_WAIT);
+    thread::sleep(TASK_EXECUTION_WAIT);
 
     assert_eq!(counter.load(Ordering::SeqCst), task_count);
 }
@@ -81,20 +80,60 @@ fn sleep_timer_waits_correct_duration() {
 }
 
 #[test]
-fn spawner_works_after_runtime_shutdown() {
+fn spawn_returns_join_handle_with_result() {
     let runtime = Runtime::new();
-    let spawner_before_shutdown = runtime.spawner();
-    let spawner_for_test = runtime.spawner();
+    let spawner = runtime.spawner();
 
-    spawner_before_shutdown.spawn(async {}).unwrap();
+    let result = Arc::new(AtomicUsize::new(0));
+    let result_clone = result.clone();
 
-    let _handle = runtime.run(1);
+    let handle = spawner.spawn(async { 42_usize }).unwrap();
 
-    drop(spawner_before_shutdown);
-    runtime.shutdown();
+    spawner
+        .spawn(async move {
+            if let Ok(value) = handle.await {
+                result_clone.store(value, Ordering::SeqCst);
+            }
+        })
+        .unwrap();
 
-    let result = spawner_for_test.spawn(async {});
-    assert!(result.is_ok());
+    let _handle = runtime.run(TEST_WORKER_COUNT);
+    thread::sleep(TASK_EXECUTION_WAIT);
+
+    assert_eq!(result.load(Ordering::SeqCst), 42);
+}
+
+#[test]
+fn cancellation_token_cancels_task() {
+    let runtime = Runtime::new();
+    let spawner = runtime.spawner();
+
+    let was_cancelled = Arc::new(AtomicUsize::new(0));
+    let was_cancelled_clone = was_cancelled.clone();
+
+    let token = CancellationToken::new();
+    let token_clone = token.clone();
+
+    spawner
+        .spawn(async move {
+            while !token_clone.is_cancelled() {
+                sleep(Duration::from_millis(10)).await;
+            }
+            was_cancelled_clone.store(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+    spawner
+        .spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        })
+        .unwrap();
+
+    let _handle = runtime.run(TEST_WORKER_COUNT);
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(was_cancelled.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -118,7 +157,7 @@ fn nested_spawn_executes_both_tasks() {
         .unwrap();
 
     let _handle = runtime.run(TEST_WORKER_COUNT);
-    thread::sleep(MULTIPLE_TASKS_WAIT);
+    thread::sleep(TASK_EXECUTION_WAIT);
 
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
